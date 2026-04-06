@@ -10,14 +10,8 @@ export { AccountPool } from "./accounts.js"
 // ─── Plugin types (loose, avoids hard @opencode-ai/plugin dep) ───────────────
 
 type PluginInput = {
-  client: {
-    tui: {
-      showToast(options: {
-        body: { title?: string; message: string; variant: "info" | "success" | "warning" | "error"; duration?: number }
-      }): Promise<unknown>
-    }
-    [k: string]: unknown
-  }
+  client: Record<string, any>
+  serverUrl: URL
   directory: string
   [k: string]: unknown
 }
@@ -151,15 +145,36 @@ export const ChatGPTRotationPlugin = async (input: PluginInput): Promise<Hooks> 
   const port = settings.port
 
   let proxyStarted = false
+  let requestCount = 0
 
   // Show a toast notification in the OpenCode TUI
   function showToast(message: string, variant: "info" | "success" | "warning" | "error" = "info") {
+    const body = { title: "ChatGPT Rotation", message, variant, duration: 3000 }
+
+    // Try SDK client methods (flat and nested)
     try {
-      input.client.tui.showToast({
-        body: { title: "ChatGPT Rotation", message, variant, duration: 3000 },
-      })
-    } catch {
-      // Silently fail if toast API isn't available
+      const c = input.client as any
+      if (typeof c.showToast === "function") {
+        c.showToast({ body }).catch(() => {})
+        return
+      }
+      if (typeof c.tui?.showToast === "function") {
+        c.tui.showToast({ body }).catch(() => {})
+        return
+      }
+    } catch {}
+
+    // Fallback: direct HTTP to OpenCode server
+    const paths = ["/tui/show-toast", "/api/tui/show-toast"]
+    for (const p of paths) {
+      try {
+        const url = new URL(p, input.serverUrl)
+        fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        }).catch(() => {})
+      } catch {}
     }
   }
 
@@ -181,6 +196,12 @@ export const ChatGPTRotationPlugin = async (input: PluginInput): Promise<Hooks> 
     const fresh = loadData()
     pool.updateAccounts(fresh.accounts)
   }
+
+  // Debug: log client methods and serverUrl to find toast API
+  const c = input.client as any
+  console.log(`[chatgpt-rotation] serverUrl: ${input.serverUrl}`)
+  console.log(`[chatgpt-rotation] client keys: ${Object.keys(c).join(", ")}`)
+  if (c.tui) console.log(`[chatgpt-rotation] client.tui keys: ${Object.keys(c.tui).join(", ")}`)
 
   // Start proxy immediately if accounts exist
   ensureProxy()
@@ -341,13 +362,35 @@ export const ChatGPTRotationPlugin = async (input: PluginInput): Promise<Hooks> 
   return {
     auth: authHook,
 
-    // Point OpenAI provider at our proxy
+    // Point OpenAI provider at our proxy for retry handling
     async config(cfg) {
       if (pool.size === 0) return
       if (!cfg.provider) cfg.provider = {}
       if (!cfg.provider.openai) cfg.provider.openai = {}
       cfg.provider.openai.baseURL = `http://localhost:${port}`
       delete cfg.provider.openai.apiKey
+    },
+
+    // Inject the rotated account's token + show toast on every API call
+    async "chat.headers"(
+      inp: { provider: { info: { id: string } }; [k: string]: any },
+      output: { headers: Record<string, string> },
+    ) {
+      // Debug: log the provider ID so we know what to filter on
+      const providerId = inp.provider?.info?.id ?? "unknown"
+      if (pool.size === 0) return
+
+      const active = await pool.getActiveToken()
+      if (!active) return
+
+      output.headers["Authorization"] = `Bearer ${active.token}`
+      pool.onSuccess(active.label)
+
+      requestCount++
+      console.log(`[chatgpt-rotation] ━━━ Request #${requestCount} → ${active.label} ━━━`)
+
+      // Show toast via direct HTTP to OpenCode server
+      showToast(`Using ${active.label}`, "info")
     },
   }
 }

@@ -33,14 +33,31 @@ function decodeJwtPayload(token: string): Record<string, any> | null {
   }
 }
 
-function extractAccountInfo(accessToken: string): { accountId?: string; email?: string } {
+const PROFILE_CLAIM_PATH = "https://api.openai.com/profile"
+
+async function extractAccountInfo(accessToken: string): Promise<{ accountId?: string; email?: string }> {
   const payload = decodeJwtPayload(accessToken)
-  if (!payload) return {}
-  const authClaim = payload[JWT_CLAIM_PATH]
-  return {
-    accountId: authClaim?.chatgpt_account_id,
-    email: payload.email ?? payload.sub,
-  }
+  const authClaim = payload?.[JWT_CLAIM_PATH]
+  const profileClaim = payload?.[PROFILE_CLAIM_PATH]
+  const accountId = authClaim?.chatgpt_account_id
+
+  // Email lives in the profile claim, not top-level
+  const email = profileClaim?.email ?? payload?.email
+
+  if (email) return { accountId, email }
+
+  // Fallback: fetch from userinfo endpoint
+  try {
+    const res = await fetch("https://auth.openai.com/userinfo", {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    })
+    if (res.ok) {
+      const info = (await res.json()) as { email?: string; name?: string }
+      if (info.email) return { accountId, email: info.email }
+    }
+  } catch {}
+
+  return { accountId, email: payload?.sub }
 }
 
 interface OAuthCallbackResult {
@@ -200,16 +217,33 @@ export async function refreshAccessToken(
 export async function verifyAccount(
   token: string,
 ): Promise<{ valid: boolean; error?: string }> {
-  try {
-    const res = await fetch("https://api.openai.com/v1/models", {
-      headers: { Authorization: `Bearer ${token}` },
-    })
-    if (res.ok) return { valid: true }
-    if (res.status === 401) return { valid: false, error: "Unauthorized — token invalid or revoked" }
-    return { valid: false, error: `HTTP ${res.status}` }
-  } catch (err) {
-    return { valid: false, error: String(err) }
+  // Try the standard API first (works for API keys)
+  // Then try ChatGPT token validation (works for OAuth tokens)
+  const endpoints = [
+    "https://api.openai.com/v1/models",
+    "https://api.openai.com/v1/me",
+  ]
+  for (const url of endpoints) {
+    try {
+      const res = await fetch(url, {
+        headers: { Authorization: `Bearer ${token}` },
+      })
+      if (res.ok) return { valid: true }
+      if (res.status === 401) return { valid: false, error: "Unauthorized — token invalid or revoked" }
+    } catch {}
   }
+
+  // If neither endpoint returned 401, check if the token is at least a valid JWT
+  const payload = decodeJwtPayload(token)
+  if (payload?.exp) {
+    const expiresAt = payload.exp * 1000
+    if (expiresAt > Date.now()) {
+      return { valid: true, error: undefined }
+    }
+    return { valid: false, error: "Token expired" }
+  }
+
+  return { valid: false, error: "Could not verify" }
 }
 
 /**
@@ -248,7 +282,7 @@ export async function runOAuthFlow(): Promise<{
         const tokens = await exchangeCode(code, codeVerifier, REDIRECT_URI)
         if (!tokens) return null
 
-        const info = extractAccountInfo(tokens.accessToken)
+        const info = await extractAccountInfo(tokens.accessToken)
 
         return {
           type: "oauth",

@@ -1,15 +1,26 @@
 import { AccountPool } from "./accounts.js"
 import { startProxyServer } from "./proxy.js"
 import { runOAuthFlow, verifyAccount } from "./oauth.js"
-import { loadData, addAccount, removeAccount, saveData, getStoragePath } from "./storage.js"
-import type { Account, OAuthAccount, ApiKeyAccount } from "./types.js"
+import { loadData, addAccount, removeAccount, saveData } from "./storage.js"
+import type { Account, ApiKeyAccount } from "./types.js"
 
 export type { Account, OAuthAccount, ApiKeyAccount, PluginSettings } from "./types.js"
 export { AccountPool } from "./accounts.js"
 
 // ─── Plugin types (loose, avoids hard @opencode-ai/plugin dep) ───────────────
 
-type PluginInput = { directory: string; [k: string]: unknown }
+type PluginInput = {
+  client: {
+    tui: {
+      showToast(options: {
+        body: { title?: string; message: string; variant: "info" | "success" | "warning" | "error"; duration?: number }
+      }): Promise<unknown>
+    }
+    [k: string]: unknown
+  }
+  directory: string
+  [k: string]: unknown
+}
 
 type SelectOption = { label: string; value: string; hint?: string }
 type Prompt =
@@ -71,13 +82,11 @@ function buildActionPrompts(pool: AccountPool): Prompt[] {
   const data = loadData()
   const options: SelectOption[] = []
 
-  // Actions
   options.push({ label: "Add account", value: "add_account", hint: "OAuth with OpenAI" })
   options.push({ label: "Check status", value: "check_status" })
   options.push({ label: "Verify one account", value: "verify_one" })
   options.push({ label: "Verify all accounts", value: "verify_all" })
 
-  // Accounts
   if (data.accounts.length > 0) {
     for (let i = 0; i < data.accounts.length; i++) {
       const acct = data.accounts[i]
@@ -92,7 +101,6 @@ function buildActionPrompts(pool: AccountPool): Prompt[] {
     }
   }
 
-  // Danger zone
   if (data.accounts.length > 0) {
     options.push({ label: "Delete all accounts", value: "delete_all", hint: "irreversible" })
   }
@@ -100,14 +108,37 @@ function buildActionPrompts(pool: AccountPool): Prompt[] {
   return [{ type: "select", key: "action", message: "Select an action or account", options }]
 }
 
-function buildVerifyOnePrompts(): Prompt[] {
+/**
+ * For non-auth actions (status, verify, etc.), return a "success" result
+ * using the first account's real token data. This avoids the
+ * "Failed to authorize" message in the OpenCode UI.
+ */
+function infoResult(message: string): AuthOAuthResult {
   const data = loadData()
-  if (data.accounts.length === 0) return []
-  const options: SelectOption[] = data.accounts.map((a, i) => ({
-    label: `${i + 1}. ${a.label} (${a.type})`,
-    value: String(i),
-  }))
-  return [{ type: "select", key: "verify_target", message: "Select account to verify", options }]
+  const firstOAuth = data.accounts.find((a) => a.type === "oauth")
+
+  return {
+    url: "data:text/html,<html><body style='font-family:system-ui;text-align:center;padding:60px'><p>Done. You can close this tab.</p></body></html>",
+    instructions: message,
+    method: "auto" as const,
+    async callback(): Promise<AuthCallbackResult> {
+      // Return success with existing token data so OpenCode doesn't show "Failed to authorize"
+      if (firstOAuth && firstOAuth.type === "oauth") {
+        return {
+          type: "success",
+          access: firstOAuth.accessToken,
+          refresh: firstOAuth.refreshToken,
+          expires: firstOAuth.expiresAt,
+          accountId: firstOAuth.accountId,
+        }
+      }
+      const firstKey = data.accounts.find((a) => a.type === "api_key")
+      if (firstKey && firstKey.type === "api_key") {
+        return { type: "success", key: firstKey.apiKey }
+      }
+      return { type: "failed" }
+    },
+  }
 }
 
 // ─── Plugin entry ────────────────────────────────────────────────────────────
@@ -121,6 +152,17 @@ export const ChatGPTRotationPlugin = async (input: PluginInput): Promise<Hooks> 
 
   let proxyStarted = false
 
+  // Show a toast notification in the OpenCode TUI
+  function showToast(message: string, variant: "info" | "success" | "warning" | "error" = "info") {
+    try {
+      input.client.tui.showToast({
+        body: { title: "ChatGPT Rotation", message, variant, duration: 3000 },
+      })
+    } catch {
+      // Silently fail if toast API isn't available
+    }
+  }
+
   function ensureProxy(): void {
     if (proxyStarted || pool.size === 0) return
     startProxyServer({
@@ -128,6 +170,9 @@ export const ChatGPTRotationPlugin = async (input: PluginInput): Promise<Hooks> 
       pool,
       maxRetries: settings.maxRetries,
       targetBaseUrl: settings.targetBaseUrl,
+      onAccountSelected(label) {
+        showToast(`Using ${label}`, "info")
+      },
     })
     proxyStarted = true
   }
@@ -148,7 +193,6 @@ export const ChatGPTRotationPlugin = async (input: PluginInput): Promise<Hooks> 
       {
         type: "oauth",
         label: "ChatGPT Plus/Pro (multi-account rotation)",
-        // Use a getter so prompts reflect latest account list each time the menu opens
         get prompts(): Prompt[] {
           return buildActionPrompts(pool)
         },
@@ -171,8 +215,7 @@ export const ChatGPTRotationPlugin = async (input: PluginInput): Promise<Hooks> 
                 reloadPool()
                 ensureProxy()
                 console.log(
-                  `[chatgpt-rotation] Added account "${account.label}". ` +
-                    `Total: ${pool.size} account(s).`,
+                  `[chatgpt-rotation] Added account "${account.label}". Total: ${pool.size}.`,
                 )
 
                 return {
@@ -198,7 +241,6 @@ export const ChatGPTRotationPlugin = async (input: PluginInput): Promise<Hooks> 
                       (s.tokenExpired ? " [token expired]" : "") +
                       (s.unlocksAt ? ` [unlocks ${s.unlocksAt}]` : ""),
                   )
-
             return infoResult(`Account Status (${statuses.length}):\n${lines.join("\n")}`)
           }
 
@@ -212,9 +254,7 @@ export const ChatGPTRotationPlugin = async (input: PluginInput): Promise<Hooks> 
             const acct = accounts[idx]
             const token = acct.type === "oauth" ? acct.accessToken : acct.apiKey
             const result = await verifyAccount(token)
-            const status = result.valid
-              ? "Valid"
-              : `Invalid — ${result.error}`
+            const status = result.valid ? "Valid" : `Invalid — ${result.error}`
             return infoResult(`${acct.label}: ${status}`)
           }
 
@@ -254,7 +294,6 @@ export const ChatGPTRotationPlugin = async (input: PluginInput): Promise<Hooks> 
             ]
               .filter(Boolean)
               .join("\n  ")
-
             return infoResult(`  ${info}`)
           }
 
@@ -291,7 +330,7 @@ export const ChatGPTRotationPlugin = async (input: PluginInput): Promise<Hooks> 
           reloadPool()
           ensureProxy()
           console.log(
-            `[chatgpt-rotation] Added API key "${account.label}". Total: ${pool.size} account(s).`,
+            `[chatgpt-rotation] Added API key "${account.label}". Total: ${pool.size}.`,
           )
           return { type: "success", key }
         },
@@ -309,19 +348,6 @@ export const ChatGPTRotationPlugin = async (input: PluginInput): Promise<Hooks> 
       if (!cfg.provider.openai) cfg.provider.openai = {}
       cfg.provider.openai.baseURL = `http://localhost:${port}`
       delete cfg.provider.openai.apiKey
-    },
-  }
-}
-
-// ── Utility: return a non-auth info result that just displays text ───────────
-
-function infoResult(message: string): AuthOAuthResult {
-  return {
-    url: "data:text/html,<html><body style='font-family:system-ui;text-align:center;padding:60px'><p>You can close this tab.</p></body></html>",
-    instructions: message,
-    method: "auto" as const,
-    async callback(): Promise<AuthCallbackResult> {
-      return { type: "failed" }
     },
   }
 }

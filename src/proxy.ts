@@ -5,6 +5,8 @@ export interface ProxyConfig {
   pool: AccountPool
   maxRetries?: number
   targetBaseUrl?: string
+  /** Called when an account is selected for a request */
+  onAccountSelected?: (label: string) => void
 }
 
 function parseRetryAfter(headers: Headers): number | undefined {
@@ -64,6 +66,11 @@ export function startProxyServer(config: ProxyConfig): void {
             },
             { status: 429, headers: { "Retry-After": String(waitSec) } },
           )
+        }
+
+        // Notify which account is being used (only on first attempt)
+        if (attempt === 0) {
+          config.onAccountSelected?.(active.label)
         }
 
         const headers = new Headers(baseHeaders)

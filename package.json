@@ -1,0 +1,23 @@
+{
+  "name": "opencode-chatgpt-rotation",
+  "version": "0.2.0",
+  "description": "OpenCode plugin — rotate multiple ChatGPT/OpenAI accounts (OAuth + API keys) to avoid rate limits",
+  "type": "module",
+  "main": "./index.ts",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "bun": ">=1.0.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.0.0"
+  },
+  "keywords": ["opencode", "plugin", "openai", "chatgpt", "rate-limit", "rotation", "oauth"],
+  "license": "MIT"
+}

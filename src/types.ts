@@ -24,7 +24,6 @@ export interface StoredData {
 
 export interface PluginSettings {
   strategy: RotationStrategy
-  port: number
   maxRetries: number
   targetBaseUrl: string
 }
@@ -44,7 +43,6 @@ export interface AccountStatus {
 
 export const DEFAULT_SETTINGS: PluginSettings = {
   strategy: "sticky",
-  port: 3099,
   maxRetries: 3,
   targetBaseUrl: "https://api.openai.com",
 }

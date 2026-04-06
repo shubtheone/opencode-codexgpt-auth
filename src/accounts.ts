@@ -1,6 +1,6 @@
 import type { Account, OAuthAccount, RateLimitState, AccountStatus, RotationStrategy } from "./types.js"
 import { refreshAccessToken } from "./oauth.js"
-import { updateAccount } from "./storage.js"
+import { updateOAuthAccountTokens } from "./storage.js"
 
 export class AccountPool {
   private accounts: Account[]
@@ -45,44 +45,58 @@ export class AccountPool {
    * For OAuth accounts, auto-refreshes if expired.
    * Returns null if the account can't provide a valid token.
    */
-  private async getToken(account: Account): Promise<string | null> {
+  private async getToken(account: Account): Promise<{ account: Account; token: string } | null> {
     if (account.type === "api_key") {
-      return account.apiKey
+      return { account, token: account.apiKey }
     }
 
     // OAuth account — check if access token is still valid (with 60s buffer)
     if (account.expiresAt > Date.now() + 60_000) {
-      return account.accessToken
+      return { account, token: account.accessToken }
     }
 
     // Token expired — refresh it
     console.log(`[chatgpt-rotation] Refreshing token for ${account.label}...`)
-    const result = await refreshAccessToken(account.refreshToken)
+    let result: { accessToken: string; refreshToken: string; expiresAt: number } | null = null
+    try {
+      result = await refreshAccessToken(account.refreshToken)
+    } catch (error) {
+      console.error(`[chatgpt-rotation] Failed to refresh token for ${account.label}`, error)
+      return null
+    }
     if (!result) {
       console.error(`[chatgpt-rotation] Failed to refresh token for ${account.label}`)
       return null
     }
 
-    // Update in-memory
-    account.accessToken = result.accessToken
-    account.refreshToken = result.refreshToken
-    account.expiresAt = result.expiresAt
-
-    // Persist to disk
-    updateAccount(account.label, {
+    // Update in-memory and persist the refreshed token set.
+    const updatedAccount: OAuthAccount = {
+      ...account,
       accessToken: result.accessToken,
       refreshToken: result.refreshToken,
       expiresAt: result.expiresAt,
-    } as Partial<OAuthAccount>)
+    }
+    const idx = this.accounts.findIndex((candidate) => candidate.label === account.label)
+    if (idx !== -1) {
+      this.accounts[idx] = updatedAccount
+    }
 
-    return result.accessToken
+    updateOAuthAccountTokens(account.label, {
+      accessToken: result.accessToken,
+      refreshToken: result.refreshToken,
+      expiresAt: result.expiresAt,
+    })
+
+    return { account: updatedAccount, token: result.accessToken }
   }
 
   /**
    * Get the next available account and its bearer token.
    * Returns null if all accounts are rate-limited or have invalid tokens.
    */
-  async getActiveToken(): Promise<{ token: string; label: string } | null> {
+  async getActiveAccount(
+    predicate?: (account: Account) => boolean,
+  ): Promise<{ account: Account; token: string; label: string } | null> {
     if (this.accounts.length === 0) return null
 
     const startIndex = this.strategy === "sticky" ? this.stickyIndex : this.roundRobinIndex
@@ -92,20 +106,28 @@ export class AccountPool {
       const account = this.accounts[idx]
       const label = this.labelOf(account)
 
+      if (predicate && !predicate(account)) continue
       if (this.isRateLimited(label)) continue
 
-      const token = await this.getToken(account)
-      if (!token) continue
+      const active = await this.getToken(account)
+      if (!active) continue
 
       // Update indices
       if (this.strategy === "sticky") {
         this.stickyIndex = idx
       }
 
-      return { token, label }
+      return { account: active.account, token: active.token, label }
     }
 
     return null
+  }
+
+  async getActiveToken(
+    predicate?: (account: Account) => boolean,
+  ): Promise<{ token: string; label: string } | null> {
+    const active = await this.getActiveAccount(predicate)
+    return active ? { token: active.token, label: active.label } : null
   }
 
   /** Called after a successful request. */
@@ -153,7 +175,9 @@ export class AccountPool {
   getMinWaitMs(): number {
     let min = Infinity
     for (const account of this.accounts) {
-      const state = this.rateLimits.get(this.labelOf(account))
+      const label = this.labelOf(account)
+      if (!this.isRateLimited(label)) return 0
+      const state = this.rateLimits.get(label)
       if (!state) return 0
       min = Math.min(min, state.until - Date.now())
     }

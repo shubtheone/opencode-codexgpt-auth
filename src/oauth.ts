@@ -1,6 +1,6 @@
 import { randomBytes, createHash } from "crypto"
 import { createServer, type IncomingMessage, type ServerResponse } from "http"
-import type { OAuthAccount } from "./types.js"
+import type { Account, OAuthAccount } from "./types.js"
 
 const CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 const AUTHORIZE_URL = "https://auth.openai.com/oauth/authorize"
@@ -9,6 +9,16 @@ const REDIRECT_PORT = 1455
 const REDIRECT_URI = `http://localhost:${REDIRECT_PORT}/auth/callback`
 const SCOPE = "openid profile email offline_access"
 const JWT_CLAIM_PATH = "https://api.openai.com/auth"
+const DEBUG = process.env.CHATGPT_ROTATION_DEBUG === "1"
+
+function debugLog(message: string, error?: unknown): void {
+  if (!DEBUG) return
+  if (error !== undefined) {
+    console.error(message, error)
+    return
+  }
+  console.error(message)
+}
 
 function generateCodeVerifier(): string {
   return randomBytes(32).toString("base64url")
@@ -72,11 +82,27 @@ function startCallbackServer(
   expectedState: string,
 ): Promise<{ port: number; waitForCode: () => Promise<OAuthCallbackResult>; close: () => void }> {
   return new Promise((resolve, reject) => {
-    let resolveCode: (result: OAuthCallbackResult) => void
+    let resolveCode!: (result: OAuthCallbackResult) => void
+    let rejectCode!: (error: Error) => void
+    let listening = false
+    let codeSettled = false
 
-    const codePromise = new Promise<OAuthCallbackResult>((res) => {
+    const codePromise = new Promise<OAuthCallbackResult>((res, rej) => {
       resolveCode = res
+      rejectCode = rej
     })
+
+    function failCode(message: string): void {
+      if (codeSettled) return
+      codeSettled = true
+      rejectCode(new Error(message))
+    }
+
+    function completeCode(result: OAuthCallbackResult): void {
+      if (codeSettled) return
+      codeSettled = true
+      resolveCode(result)
+    }
 
     const server = createServer((req: IncomingMessage, res: ServerResponse) => {
       const url = new URL(req.url || "/", "http://localhost")
@@ -91,6 +117,7 @@ function startCallbackServer(
       if (state !== expectedState) {
         res.writeHead(400)
         res.end("State mismatch — possible CSRF attack.")
+        failCode("State mismatch during OAuth callback")
         return
       }
 
@@ -98,6 +125,7 @@ function startCallbackServer(
       if (!code) {
         res.writeHead(400)
         res.end("Missing authorization code.")
+        failCode("Missing authorization code during OAuth callback")
         return
       }
 
@@ -109,11 +137,20 @@ function startCallbackServer(
         </body></html>
       `)
 
-      resolveCode({ code })
+      completeCode({ code })
+    })
+
+    server.on("error", (error) => {
+      const err = error instanceof Error ? error : new Error(String(error))
+      failCode(err.message)
+      if (!listening) {
+        reject(err)
+      }
     })
 
     // Must use port 1455 — OpenAI's allowed redirect URI for this client_id
     server.listen(REDIRECT_PORT, "127.0.0.1", () => {
+      listening = true
       const addr = server.address()
       if (!addr || typeof addr === "string") {
         reject(new Error("Failed to start callback server"))
@@ -178,72 +215,93 @@ async function exchangeCode(
 export async function refreshAccessToken(
   refreshToken: string,
 ): Promise<{ accessToken: string; refreshToken: string; expiresAt: number } | null> {
-  const res = await fetch(TOKEN_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      grant_type: "refresh_token",
-      refresh_token: refreshToken,
-      client_id: CLIENT_ID,
-    }),
-  })
+  try {
+    const res = await fetch(TOKEN_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: refreshToken,
+        client_id: CLIENT_ID,
+      }),
+    })
 
-  if (!res.ok) {
-    const text = await res.text()
-    console.error(`[chatgpt-rotation] Token refresh failed: ${res.status} ${text}`)
+    if (!res.ok) {
+      const text = await res.text()
+      console.error(`[chatgpt-rotation] Token refresh failed: ${res.status} ${text}`)
+      return null
+    }
+
+    const json = (await res.json()) as {
+      access_token?: string
+      refresh_token?: string
+      expires_in?: number
+    }
+
+    if (!json.access_token || !json.expires_in) {
+      return null
+    }
+
+    return {
+      accessToken: json.access_token,
+      refreshToken: json.refresh_token ?? refreshToken, // some responses reuse the same refresh token
+      expiresAt: Date.now() + json.expires_in * 1000,
+    }
+  } catch (error) {
+    console.error("[chatgpt-rotation] Token refresh request failed", error)
     return null
-  }
-
-  const json = (await res.json()) as {
-    access_token?: string
-    refresh_token?: string
-    expires_in?: number
-  }
-
-  if (!json.access_token || !json.expires_in) {
-    return null
-  }
-
-  return {
-    accessToken: json.access_token,
-    refreshToken: json.refresh_token ?? refreshToken, // some responses reuse the same refresh token
-    expiresAt: Date.now() + json.expires_in * 1000,
   }
 }
 
 /**
  * Verify that an account's token is still valid by hitting the OpenAI models endpoint.
  */
-export async function verifyAccount(
-  token: string,
-): Promise<{ valid: boolean; error?: string }> {
-  // Try the standard API first (works for API keys)
-  // Then try ChatGPT token validation (works for OAuth tokens)
-  const endpoints = [
-    "https://api.openai.com/v1/models",
-    "https://api.openai.com/v1/me",
-  ]
-  for (const url of endpoints) {
-    try {
-      const res = await fetch(url, {
-        headers: { Authorization: `Bearer ${token}` },
-      })
-      if (res.ok) return { valid: true }
-      if (res.status === 401) return { valid: false, error: "Unauthorized — token invalid or revoked" }
-    } catch {}
-  }
-
-  // If neither endpoint returned 401, check if the token is at least a valid JWT
-  const payload = decodeJwtPayload(token)
-  if (payload?.exp) {
-    const expiresAt = payload.exp * 1000
-    if (expiresAt > Date.now()) {
-      return { valid: true, error: undefined }
+async function verifyApiKeyAccount(apiKey: string): Promise<{ valid: boolean; error?: string }> {
+  try {
+    const res = await fetch("https://api.openai.com/v1/models", {
+      headers: { Authorization: `Bearer ${apiKey}` },
+    })
+    if (res.ok || res.status === 429) return { valid: true }
+    if (res.status === 401 || res.status === 403) {
+      return { valid: false, error: "Unauthorized — key invalid or revoked" }
     }
-    return { valid: false, error: "Token expired" }
+    return { valid: false, error: `Verification failed (${res.status})` }
+  } catch (error) {
+    debugLog("[chatgpt-rotation] API key verification request failed", error)
+    return { valid: false, error: "Verification request failed" }
+  }
+}
+
+async function verifyOAuthAccount(account: OAuthAccount): Promise<{ valid: boolean; error?: string }> {
+  let accessToken = account.accessToken
+
+  if (account.expiresAt <= Date.now() + 60_000) {
+    const refreshed = await refreshAccessToken(account.refreshToken)
+    if (!refreshed) {
+      return { valid: false, error: "Token refresh failed" }
+    }
+    accessToken = refreshed.accessToken
   }
 
-  return { valid: false, error: "Could not verify" }
+  try {
+    const res = await fetch("https://auth.openai.com/userinfo", {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    })
+    if (res.ok || res.status === 429) return { valid: true }
+    if (res.status === 401 || res.status === 403) {
+      return { valid: false, error: "Unauthorized — token invalid or revoked" }
+    }
+    return { valid: false, error: `Verification failed (${res.status})` }
+  } catch (error) {
+    debugLog("[chatgpt-rotation] OAuth verification request failed", error)
+    return { valid: false, error: "Verification request failed" }
+  }
+}
+
+export async function verifyAccount(account: Account): Promise<{ valid: boolean; error?: string }> {
+  return account.type === "api_key"
+    ? verifyApiKeyAccount(account.apiKey)
+    : verifyOAuthAccount(account)
 }
 
 /**

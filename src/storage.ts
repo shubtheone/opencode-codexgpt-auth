@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs"
+import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync } from "fs"
 import { homedir } from "os"
 import { join } from "path"
 import type { Account, StoredData, PluginSettings } from "./types.js"
@@ -31,7 +31,9 @@ export function loadData(): StoredData {
 
 export function saveData(data: StoredData): void {
   ensureDir()
-  writeFileSync(STORAGE_FILE, JSON.stringify(data, null, 2), { mode: 0o600 })
+  const tempFile = `${STORAGE_FILE}.tmp`
+  writeFileSync(tempFile, JSON.stringify(data, null, 2), { mode: 0o600 })
+  renameSync(tempFile, STORAGE_FILE)
 }
 
 export function addAccount(account: Account): void {
@@ -55,11 +57,15 @@ export function removeAccount(label: string): boolean {
   return true
 }
 
-export function updateAccount(label: string, update: Partial<Account>): void {
+export function updateOAuthAccountTokens(
+  label: string,
+  update: Pick<Extract<Account, { type: "oauth" }>, "accessToken" | "refreshToken" | "expiresAt">,
+): void {
   const data = loadData()
   const idx = data.accounts.findIndex((a) => a.label === label)
-  if (idx !== -1) {
-    data.accounts[idx] = { ...data.accounts[idx], ...update } as Account
+  const account = data.accounts[idx]
+  if (account?.type === "oauth") {
+    data.accounts[idx] = { ...account, ...update }
     saveData(data)
   }
 }
